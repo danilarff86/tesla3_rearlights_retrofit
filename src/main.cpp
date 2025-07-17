@@ -1,6 +1,9 @@
 #include <Arduino.h>
 #include <stdint.h>
 
+const int32_t lastLowDelay = 80;
+const int32_t lashChangeDelay = 10;
+
 // Define pin number
 int ledPin = 13;
 
@@ -11,16 +14,35 @@ int leftTurnSignalOutputPin = 5;
 int rightTurnSignalOutputPin = 6;
 
 // Define timer counter
-volatile uint32_t timer1Counter = 0;
+volatile int32_t timer1Counter = 0;
 
 decltype(timer1Counter) lastLeftTurnSignalChangeHL = 0;
 decltype(timer1Counter) lastRightTurnSignalChangeHL = 0;
 decltype(timer1Counter) lastBrakeSignalChangeHL = 0;
+decltype(timer1Counter) lastLeftChange = 0;
+decltype(timer1Counter) lastRightChange = 0;
 uint8_t lastLeftTurnSignalState = LOW;
 uint8_t lastRightTurnSignalState = LOW;
 uint8_t lastBrakeSignalState = LOW;
 
+uint8_t lastLeftStates[3] = {LOW, LOW, LOW};
+uint8_t lastRightStates[3] = {LOW, LOW, LOW};
+uint8_t lastBrakeStates[3] = {LOW, LOW, LOW};
+
 void updateLastStates();
+
+void updateStateBuffer(uint8_t *buffer, uint8_t state) {
+  buffer[0] = buffer[1];
+  buffer[1] = buffer[2];
+  buffer[2] = state;
+}
+
+uint8_t getBufferState(uint8_t *buffer) {
+  if (buffer[0] == LOW && buffer[1] == LOW && buffer[2] == LOW) {
+    return LOW;
+  }
+  return HIGH;
+}
 
 class InterruptLock {
 public:
@@ -37,6 +59,11 @@ decltype(timer1Counter) getTimer1Counter() {
 void setup() {
   // Initialize the digital pin as an output.
   pinMode(ledPin, OUTPUT);
+  pinMode(brakeSignalPin, INPUT);
+  pinMode(leftTurnSignalInputPin, INPUT);
+  pinMode(rightTurnSignalInputPin, INPUT);
+  pinMode(leftTurnSignalOutputPin, OUTPUT);
+  pinMode(rightTurnSignalOutputPin, OUTPUT);
 
   // Set up the timer interrupt
   auto lock = InterruptLock{};
@@ -76,28 +103,30 @@ void loop() {
   // const auto rightTurnSignalState = digitalRead(rightTurnSignalInputPin);
   const auto brakeSignalState = digitalRead(brakeSignalPin);
 
-  auto allowLeftTurnSignal =
-      brakeSignalState == LOW || // Brake signal is not active
-      ((timer1CounterVal - lastLeftTurnSignalChangeHL) <
-           80 && // Turn signal
-                 // change was
-                 // less than 400ms
-       abs(lastLeftTurnSignalChangeHL - lastBrakeSignalChangeHL) >
-           5); // Brake
-               // signal
-               // change
-               // diff more
-               // than 50ms
+  bool allowLeftTurnSignal = true;
+  bool allowRightTurnSignal = true;
 
-  auto allowRightTurnSignal =
-      brakeSignalState == LOW ||
-      ((timer1CounterVal - lastRightTurnSignalChangeHL) < 80 &&
-       abs(lastRightTurnSignalChangeHL - lastBrakeSignalChangeHL) > 5);
+  if (brakeSignalState == HIGH) {
+    allowLeftTurnSignal =
+        (timer1CounterVal - lastLeftTurnSignalChangeHL) < lastLowDelay;
+    allowRightTurnSignal =
+        (timer1CounterVal - lastRightTurnSignalChangeHL) < lastLowDelay;
+  }
 
-  // allowLeftTurnSignal = true;
   // allowRightTurnSignal = true;
-  digitalWrite(leftTurnSignalOutputPin, allowLeftTurnSignal ? LOW : HIGH);
-  digitalWrite(rightTurnSignalOutputPin, allowRightTurnSignal ? LOW : HIGH);
+
+  if (timer1CounterVal - lastLeftChange > lashChangeDelay) {
+    lastLeftChange = timer1CounterVal;
+    digitalWrite(leftTurnSignalOutputPin, allowLeftTurnSignal ? LOW : HIGH);
+  }
+  if (timer1CounterVal - lastRightChange > lashChangeDelay) {
+    lastRightChange = timer1CounterVal;
+    // digitalWrite(ledPin, allowRightTurnSignal ? LOW : HIGH);
+    digitalWrite(rightTurnSignalOutputPin, allowRightTurnSignal ? LOW : HIGH);
+  }
+
+  // digitalWrite(rightTurnSignalOutputPin, LOW);
+  // digitalWrite(rightTurnSignalOutputPin, LOW);
 
   updateLastStates();
 }
@@ -105,16 +134,22 @@ void loop() {
 void updateLastStates() {
   const auto timer1CounterVal = getTimer1Counter();
 
-  const auto leftTurnSignalState = digitalRead(leftTurnSignalInputPin);
-  const auto rightTurnSignalState = digitalRead(rightTurnSignalInputPin);
-  const auto brakeSignalState = digitalRead(brakeSignalPin);
+  auto leftTurnSignalState = digitalRead(leftTurnSignalInputPin);
+  auto rightTurnSignalState = digitalRead(rightTurnSignalInputPin);
+  auto brakeSignalState = digitalRead(brakeSignalPin);
+  updateStateBuffer(lastLeftStates, leftTurnSignalState);
+  updateStateBuffer(lastRightStates, rightTurnSignalState);
+  updateStateBuffer(lastBrakeStates, brakeSignalState);
+  leftTurnSignalState = getBufferState(lastLeftStates);
+  rightTurnSignalState = getBufferState(lastRightStates);
+  brakeSignalState = getBufferState(lastBrakeStates);
 
   if (leftTurnSignalState == LOW && lastLeftTurnSignalState == HIGH) {
     lastLeftTurnSignalChangeHL = timer1CounterVal;
   }
   if (rightTurnSignalState == LOW && lastRightTurnSignalState == HIGH) {
-    lastRightTurnSignalChangeHL = timer1CounterVal;
     // digitalWrite(ledPin, digitalRead(ledPin) ^ 1); // Toggle LED on pin 13
+    lastRightTurnSignalChangeHL = timer1CounterVal;
   }
   if (brakeSignalState == LOW && lastBrakeSignalState == HIGH) {
     lastBrakeSignalChangeHL = timer1CounterVal;
