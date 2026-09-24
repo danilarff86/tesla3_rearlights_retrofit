@@ -1,131 +1,144 @@
 #include <Arduino.h>
+#include <avr/wdt.h>
 #include <stdint.h>
 
-// Define pin number
-int ledPin = 13;
+// Pin assignments
+constexpr uint8_t kBrakeSignalPin = 2;
+constexpr uint8_t kLeftTurnSignalInputPin = 3;
+constexpr uint8_t kRightTurnSignalInputPin = 4;
+constexpr uint8_t kLeftTurnSignalOutputPin = 5;
+constexpr uint8_t kRightTurnSignalOutputPin = 6;
 
-int brakeSignalPin = 2;
-int leftTurnSignalInputPin = 3;
-int rightTurnSignalInputPin = 4;
-int leftTurnSignalOutputPin = 5;
-int rightTurnSignalOutputPin = 6;
+// Input mode for the signal pins. Use INPUT_PULLUP (and invert the logic)
+// if the input stage is an open-collector optocoupler.
+constexpr uint8_t kSignalInputMode = INPUT;
 
-// Define timer counter
-volatile uint32_t timer1Counter = 0;
+// Output level meaning "turn signal allowed". This is also the safe state
+// the outputs are driven to at boot.
+constexpr uint8_t kAllowLevel = LOW;
+constexpr uint8_t kSuppressLevel = HIGH;
 
-decltype(timer1Counter) lastLeftTurnSignalChangeHL = 0;
-decltype(timer1Counter) lastRightTurnSignalChangeHL = 0;
-decltype(timer1Counter) lastBrakeSignalChangeHL = 0;
-uint8_t lastLeftTurnSignalState = LOW;
-uint8_t lastRightTurnSignalState = LOW;
-uint8_t lastBrakeSignalState = LOW;
+// Timing, in milliseconds
+// A turn signal falling edge keeps the turn signal allowed for this long.
+// Must be longer than one full blink period so the output stays allowed
+// between flashes.
+constexpr uint32_t kTurnSignalWindowMs = 800;
+// Turn and brake falling edges closer than this are treated as the same
+// event (e.g. both lines dropping when the brake is released).
+constexpr uint32_t kEdgeCoincidenceMs = 50;
+// An input must hold a new level this long before it is accepted.
+constexpr uint32_t kDebounceMs = 20;
 
-void updateLastStates();
+// A digital input with debouncing and HIGH -> LOW edge tracking.
+struct DebouncedInput {
+  uint8_t pin;
+  uint8_t stableState;
+  uint8_t candidateState;
+  uint32_t candidateSinceMs;
+  // Time the last accepted HIGH -> LOW transition started.
+  uint32_t lastFallingEdgeMs;
+  bool hasFallingEdge;
 
-class InterruptLock {
-public:
-  InterruptLock() { cli(); }  // Disable global interrupts
-  ~InterruptLock() { sei(); } // Enable global interrupts
+  explicit DebouncedInput(uint8_t inputPin)
+      : pin(inputPin), stableState(LOW), candidateState(LOW),
+        candidateSinceMs(0), lastFallingEdgeMs(0), hasFallingEdge(false) {}
+
+  void begin(uint32_t nowMs) {
+    pinMode(pin, kSignalInputMode);
+    stableState = candidateState = digitalRead(pin);
+    candidateSinceMs = nowMs;
+  }
+
+  void update(uint32_t nowMs) {
+    const uint8_t raw = digitalRead(pin);
+    if (raw != candidateState) {
+      candidateState = raw;
+      candidateSinceMs = nowMs;
+    } else if (raw != stableState &&
+               nowMs - candidateSinceMs >= kDebounceMs) {
+      if (stableState == HIGH && raw == LOW) {
+        // Timestamp the edge when it started, so the debounce delay does not
+        // skew comparisons between inputs.
+        lastFallingEdgeMs = candidateSinceMs;
+        hasFallingEdge = true;
+      }
+      stableState = raw;
+    }
+  }
 };
 
-decltype(timer1Counter) getTimer1Counter() {
-  auto lock = InterruptLock{};
-  return timer1Counter;
+DebouncedInput brakeSignal(kBrakeSignalPin);
+DebouncedInput leftTurnSignal(kLeftTurnSignalInputPin);
+DebouncedInput rightTurnSignal(kRightTurnSignalInputPin);
+
+// Absolute difference of two millis() timestamps, correct across wrap-around.
+uint32_t absDiffMs(uint32_t a, uint32_t b) {
+  const uint32_t diff = a - b;
+  return static_cast<int32_t>(diff) < 0 ? 0u - diff : diff;
+}
+
+bool isTurnSignalAllowed(const DebouncedInput &turnSignal, uint32_t nowMs) {
+  if (brakeSignal.stableState == LOW) {
+    return true; // Brake signal is not active
+  }
+  if (!turnSignal.hasFallingEdge) {
+    return false;
+  }
+  const bool turnSignalRecentlyChanged =
+      nowMs - turnSignal.lastFallingEdgeMs < kTurnSignalWindowMs;
+  const bool independentOfBrake =
+      !brakeSignal.hasFallingEdge ||
+      absDiffMs(turnSignal.lastFallingEdgeMs, brakeSignal.lastFallingEdgeMs) >
+          kEdgeCoincidenceMs;
+  return turnSignalRecentlyChanged && independentOfBrake;
 }
 
 // The setup function runs once when you press reset or power the board
 void setup() {
-  // Initialize the digital pin as an output.
-  pinMode(ledPin, OUTPUT);
+  // Clear a pending watchdog reset so it does not fire again during setup.
+  MCUSR = 0;
+  wdt_disable();
 
-  // Set up the timer interrupt
-  auto lock = InterruptLock{};
-  // Set up Timer1
-  TCCR1A = 0; // Set entire TCCR1A register to 0
-  TCCR1B = 0; // Same for TCCR1B
+  // Drive the outputs to the safe state before enabling them, so they never
+  // glitch to the suppress level.
+  digitalWrite(kLeftTurnSignalOutputPin, kAllowLevel);
+  digitalWrite(kRightTurnSignalOutputPin, kAllowLevel);
+  pinMode(kLeftTurnSignalOutputPin, OUTPUT);
+  pinMode(kRightTurnSignalOutputPin, OUTPUT);
 
-  // Set compare match register to desired timer count:
-  // 16 MHz Clock / 64 prescaler = 250,000 counts per second
-  // 250,000 / 100 = 2,500 counts for 10 ms
-  OCR1A = 2499; // = 2500 - 1 (as timer count starts from 0)
+  const uint32_t nowMs = millis();
+  brakeSignal.begin(nowMs);
+  leftTurnSignal.begin(nowMs);
+  rightTurnSignal.begin(nowMs);
 
-  // Turn on CTC mode (Clear Timer on Compare Match)
-  TCCR1B |= (1 << WGM12);
-  // Set CS10 and CS11 bits for 64 prescaler
-  TCCR1B |= (1 << CS11) | (1 << CS10);
-  // Enable timer compare interrupt
-  TIMSK1 |= (1 << OCIE1A);
+  wdt_enable(WDTO_250MS);
 }
-
-// Timer1 interrupt service routine called every 10ms
-ISR(TIMER1_COMPA_vect) { timer1Counter++; }
 
 // The loop function runs over and over again forever
 void loop() {
-  // Main loop code
-  // Example: Toggle an LED every second
-  static decltype(timer1Counter) lastToggle = 0;
-  auto timer1CounterVal = getTimer1Counter();
-  if (timer1CounterVal - lastToggle >= 100) { // 100 * 10ms = 1000ms
-    // digitalWrite(ledPin, digitalRead(ledPin) ^ 1); // Toggle LED on pin 13
-    lastToggle = timer1CounterVal;
-  }
+  const uint32_t nowMs = millis();
 
-  // Turn signal logic
-  // const auto leftTurnSignalState = digitalRead(leftTurnSignalInputPin);
-  // const auto rightTurnSignalState = digitalRead(rightTurnSignalInputPin);
-  const auto brakeSignalState = digitalRead(brakeSignalPin);
+  brakeSignal.update(nowMs);
+  leftTurnSignal.update(nowMs);
+  rightTurnSignal.update(nowMs);
 
-  auto allowLeftTurnSignal =
-      brakeSignalState == LOW || // Brake signal is not active
-      ((timer1CounterVal - lastLeftTurnSignalChangeHL) <
-           80 && // Turn signal
-                 // change was
-                 // less than 400ms
-       abs(lastLeftTurnSignalChangeHL - lastBrakeSignalChangeHL) >
-           5); // Brake
-               // signal
-               // change
-               // diff more
-               // than 50ms
+  digitalWrite(kLeftTurnSignalOutputPin,
+               isTurnSignalAllowed(leftTurnSignal, nowMs) ? kAllowLevel
+                                                          : kSuppressLevel);
+  digitalWrite(kRightTurnSignalOutputPin,
+               isTurnSignalAllowed(rightTurnSignal, nowMs) ? kAllowLevel
+                                                           : kSuppressLevel);
 
-  auto allowRightTurnSignal =
-      brakeSignalState == LOW ||
-      ((timer1CounterVal - lastRightTurnSignalChangeHL) < 80 &&
-       abs(lastRightTurnSignalChangeHL - lastBrakeSignalChangeHL) > 5);
-
-  // allowLeftTurnSignal = true;
-  // allowRightTurnSignal = true;
-  digitalWrite(leftTurnSignalOutputPin, allowLeftTurnSignal ? LOW : HIGH);
-  digitalWrite(rightTurnSignalOutputPin, allowRightTurnSignal ? LOW : HIGH);
-
-  updateLastStates();
+  wdt_reset();
 }
 
-void updateLastStates() {
-  const auto timer1CounterVal = getTimer1Counter();
-
-  const auto leftTurnSignalState = digitalRead(leftTurnSignalInputPin);
-  const auto rightTurnSignalState = digitalRead(rightTurnSignalInputPin);
-  const auto brakeSignalState = digitalRead(brakeSignalPin);
-
-  if (leftTurnSignalState == LOW && lastLeftTurnSignalState == HIGH) {
-    lastLeftTurnSignalChangeHL = timer1CounterVal;
-  }
-  if (rightTurnSignalState == LOW && lastRightTurnSignalState == HIGH) {
-    lastRightTurnSignalChangeHL = timer1CounterVal;
-    // digitalWrite(ledPin, digitalRead(ledPin) ^ 1); // Toggle LED on pin 13
-  }
-  if (brakeSignalState == LOW && lastBrakeSignalState == HIGH) {
-    lastBrakeSignalChangeHL = timer1CounterVal;
-  }
-
-  lastLeftTurnSignalState = leftTurnSignalState;
-  lastRightTurnSignalState = rightTurnSignalState;
-  lastBrakeSignalState = brakeSignalState;
-}
-
-// Possible cases:
-// - Turn signal starts withouth brake signal
-// - Turn signal starts withouth brake signal and brake signal starts
-// - Turn signal starts with brake signal
+// Behaviour per case:
+// - Brake not active: turn signal output is always allowed.
+// - Brake active, no turn signal: output is suppressed.
+// - Turn signal blinking, then brake applied: allowed, because each blink's
+//   falling edge re-opens the kTurnSignalWindowMs window.
+// - Brake active, then turn signal starts: suppressed until the first blink's
+//   falling edge, then allowed while blinking continues.
+// - A turn line falling edge within kEdgeCoincidenceMs of a brake falling
+//   edge (both lines dropping on brake release) is not counted as turn signal
+//   activity, so re-applying the brake shortly after stays suppressed.
